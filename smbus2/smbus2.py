@@ -1,4 +1,4 @@
-"""smbus2 - A drop-in replacement for smbus-cffi/smbus-python"""
+"""usmbus2 - A MicroPython drop-in replacement for smbus-cffi/smbus-python"""
 # The MIT License (MIT)
 # Copyright (c) 2020 Karl-Petter Lindegaard
 #
@@ -23,8 +23,11 @@
 import os
 import sys
 from fcntl import ioctl
-from ctypes import c_uint32, c_uint8, c_uint16, c_char, POINTER, Structure, Array, Union, create_string_buffer, string_at
+# from ctypes import c_uint32, c_uint8, c_uint16, c_char, POINTER, Structure, Array, Union, create_string_buffer, string_at
+import uctypes # import c_uint32, c_uint8, c_uint16, c_char, POINTER, Structure, Array, Union, create_string_buffer, string_at
 
+def POINTER(descriptor_class, offset):
+    return (uctypes.PTR | offset, descriptor_class.desc)
 
 # Commands from uapi/linux/i2c-dev.h
 I2C_SLAVE = 0x0703  # Use this slave address
@@ -97,69 +100,101 @@ class I2cFunc(IntFlag):
 # i2c_msg flags from uapi/linux/i2c.h
 I2C_M_RD = 0x0001
 
-# Pointer definitions
-LP_c_uint8 = POINTER(c_uint8)
-LP_c_uint16 = POINTER(c_uint16)
-LP_c_uint32 = POINTER(c_uint32)
-
 
 #############################################################
 # Type definitions as in i2c.h
 
+I2C_SMBUS_BLOCK_MAX = 32
+class union_i2c_smbus_data():
+    desc = {
+        "byte":   uctypes.UINT8  | 0,
+        "word":   uctypes.UINT16 | 0,
+        "block": (uctypes.ARRAY  | 0,  I2C_SMBUS_BLOCK_MAX+2 | uctypes.UINT8)
+    }
 
-class i2c_smbus_data(Array):
-    """
-    Adaptation of the i2c_smbus_data union in ``i2c.h``.
+    def __init__(self, byte=None, word=None, block=None):
+        self.mem = bytearray(uctypes.sizeof(self.desc))
+        self.mv  = memoryview(self.mem)
+        self.data = uctypes.struct(uctypes.addressof(self.mv), self.desc, uctypes.NATIVE)
 
-    Data for SMBus messages.
-    """
-    _length_ = I2C_SMBUS_BLOCK_MAX + 2
-    _type_ = c_uint8
+        if byte is not None:
+            self.data.byte = byte
+        elif word is not None:
+            self.data.word = word
+        elif block is not None:
+            self.data.block = block
 
+    def addr(self):
+        return uctypes.addressof(self.mv)
 
-class union_i2c_smbus_data(Union):
-    _fields_ = [
-        ("byte", c_uint8),
-        ("word", c_uint16),
-        ("block", i2c_smbus_data)
-    ]
-
-
-union_pointer_type = POINTER(union_i2c_smbus_data)
-
-
-class i2c_smbus_ioctl_data(Structure):
+class i2c_smbus_ioctl_data():
     """
     As defined in ``i2c-dev.h``.
     """
-    _fields_ = [
-        ('read_write', c_uint8),
-        ('command', c_uint8),
-        ('size', c_uint32),
-        ('data', union_pointer_type)]
-    __slots__ = [name for name, type in _fields_]
+    desc = {
+        'read_write':  uctypes.UINT8  | 0,
+        'command':     uctypes.UINT8  | 1,
+        'size':        uctypes.UINT32 | 4,
+        'data':       (uctypes.PTR    | 8, union_i2c_smbus_data.desc),
+        'data__':      uctypes.INT32  | 8 # data can't be set, so use this instead
+    }
+
+    def __init__(self, read_write=I2C_SMBUS_READ, command=0, size=I2C_SMBUS_BYTE_DATA):
+        self.mem = bytearray(uctypes.sizeof(self.desc))
+        self.mv  = memoryview(self.mem)
+        self.data = uctypes.struct(uctypes.addressof(self.mv), self.desc, uctypes.NATIVE)
+
+        self.u = union_i2c_smbus_data()
+
+        self.data.read_write = read_write
+        self.data.command    = command
+        self.data.size       = size
+        self.data.data__     = self.u.addr()
+
+    def addr(self):
+        return uctypes.addressof(self.mv)
+
 
     @staticmethod
     def create(read_write=I2C_SMBUS_READ, command=0, size=I2C_SMBUS_BYTE_DATA):
-        u = union_i2c_smbus_data()
-        return i2c_smbus_ioctl_data(
-            read_write=read_write, command=command, size=size,
-            data=union_pointer_type(u))
+        return i2c_smbus_ioctl_data( read_write=read_write, command=command, size=size)
 
 
 #############################################################
 # Type definitions for i2c_rdwr combined transactions
 
 
-class i2c_msg(Structure):
+class i2c_msg():
     """
     As defined in ``i2c.h``.
     """
-    _fields_ = [
-        ('addr', c_uint16),
-        ('flags', c_uint16),
-        ('len', c_uint16),
-        ('buf', POINTER(c_char))]
+    desc = {
+        'addr':  uctypes.UINT16 | 0,
+        'flags': uctypes.UINT16 | 2,
+        'len':   uctypes.UINT16 | 4,
+        'buf':  (uctypes.PTR    | 8, uctypes.UINT8),
+        'buf__': uctypes.INT32  | 8
+    }
+
+    def __init__(self, addr, flags, length = None, buf = None):
+        self.mem = bytearray(uctypes.sizeof(self.desc))
+        self.mv  = memoryview(self.mem)
+        self.data = uctypes.struct(uctypes.addressof(self.mv), self.desc, uctypes.NATIVE)
+
+        assert length is not None or buf is not None
+
+        if length is not None:
+            self.child = bytearray(length)
+        else: # buf is not None
+            self.child = buf
+            length = len(buf)
+
+        self.buf = memoryview(self.child)
+
+        self.data.addr  = addr
+        self.data.flags = flags
+        self.data.len   = length
+        self.data.buf__ = uctypes.addressof(self.buf)
 
     def __iter__(self):
         """ Iterator / Generator
@@ -168,18 +203,18 @@ class i2c_msg(Structure):
         :rtype: :py:class:`generator` which returns int values
         """
         idx = 0
-        while idx < self.len:
-            yield ord(self.buf[idx])
+        while idx < self.data.len:
+            yield self.data.buf[idx]
             idx += 1
 
     def __len__(self):
-        return self.len
+        return self.data.len
 
     def __bytes__(self):
-        return string_at(self.buf, self.len)
+        return uctypes.bytes_at(self.data.buf__, self.data.len)
 
     def __repr__(self):
-        return 'i2c_msg(%d,%d,%r)' % (self.addr, self.flags, self.__bytes__())
+        return 'i2c_msg(%d,%d,%r)' % (self.data.addr, self.data.flags, self.__bytes__())
 
     def __str__(self):
         s = self.__bytes__()
@@ -199,10 +234,7 @@ class i2c_msg(Structure):
         :return: New :py:class:`i2c_msg` instance for read operation.
         :rtype: :py:class:`i2c_msg`
         """
-        arr = create_string_buffer(length)
-        return i2c_msg(
-            addr=address, flags=I2C_M_RD, len=length,
-            buf=arr)
+        return i2c_msg(addr=address, flags=I2C_M_RD, length=length)
 
     @staticmethod
     def write(address, buf):
@@ -216,41 +248,52 @@ class i2c_msg(Structure):
         :return: New :py:class:`i2c_msg` instance for write operation.
         :rtype: :py:class:`i2c_msg`
         """
-        if sys.version_info.major >= 3:
-            if type(buf) is str:
-                buf = bytes(map(ord, buf))
-            else:
-                buf = bytes(buf)
+        if type(buf) is str:
+            buf = bytes(map(ord, buf))
         else:
-            if type(buf) is not str:
-                buf = ''.join([chr(x) for x in buf])
-        arr = create_string_buffer(buf, len(buf))
-        return i2c_msg(
-            addr=address, flags=0, len=len(arr),
-            buf=arr)
+            buf = bytes(buf)
+        return i2c_msg(addr=address, flags=0, buf=buf)
 
 
-class i2c_rdwr_ioctl_data(Structure):
+class i2c_rdwr_ioctl_data():
     """
     As defined in ``i2c-dev.h``.
     """
-    _fields_ = [
-        ('msgs', POINTER(i2c_msg)),
-        ('nmsgs', c_uint32)
-    ]
-    __slots__ = [name for name, type in _fields_]
+    desc = {
+        'msgs':   (uctypes.PTR   | 0, i2c_msg.desc),
+        'msgs__':  uctypes.INT32 | 0,
+        'nmsgs':  uctypes.UINT32 | 4
+    }
+
+    def __init__(self, msgs, nmsgs):
+        self.mem = bytearray(uctypes.sizeof(self.desc))
+        self.mv  = memoryview(self.mem)
+        self.data = uctypes.struct(uctypes.addressof(self.mv), self.desc, uctypes.NATIVE)
+
+        self.child = msgs
+        self.buf = memoryview(self.child)
+
+        self.data.msgs__ = uctypes.addressof(self.buf)
+        self.data.nmsgs = nmsgs
+
+    def addr(self):
+        return uctypes.addressof(self.mv)
 
     @staticmethod
     def create(*i2c_msg_instances):
         """
         Factory method for creating a i2c_rdwr_ioctl_data struct that can
-        be called with ``ioctl(fd, I2C_RDWR, data)``.
+        be called with ``ioctl(fd, I2C_RDWR, data.addr())``.
 
         :param i2c_msg_instances: Up to 42 i2c_msg instances
         :rtype: i2c_rdwr_ioctl_data
         """
         n_msg = len(i2c_msg_instances)
-        msg_array = (i2c_msg * n_msg)(*i2c_msg_instances)
+        # copy each byte of the i2c_msg into single array of i2c_msg's
+        msg_array = bytearray() # size = n_msg * uctypes.sizeof(i2c_msg.desc)
+        for msg in i2c_msg_instances:
+            msg_array.extend(msg.mem)
+
         return i2c_rdwr_ioctl_data(
             msgs=msg_array,
             nmsgs=n_msg
@@ -308,7 +351,7 @@ class SMBus(object):
             raise TypeError("Unexpected type(bus)={}".format(type(bus)))
 
         self.fd = os.open(filepath, os.O_RDWR)
-        self.funcs = self._get_funcs()
+#        self.funcs = self._get_funcs()
 
     def close(self):
         """
@@ -355,15 +398,14 @@ class SMBus(object):
             self.address = address
             self._force_last = force
 
-    def _get_funcs(self):
-        """
-        Returns a 32-bit value stating supported I2C functions.
-
-        :rtype: int
-        """
-        f = c_uint32()
-        ioctl(self.fd, I2C_FUNCS, f)
-        return f.value
+#    def _get_funcs(self):
+#        """
+#        Returns a 32-bit value stating supported I2C functions.
+#        :rtype: int
+#        """
+#        f = c_uint32()
+#        ioctl(self.fd, I2C_FUNCS, f)
+#        return f.value
 
     def write_quick(self, i2c_addr, force=None):
         """
@@ -376,7 +418,7 @@ class SMBus(object):
         self._set_address(i2c_addr, force=force)
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=0, size=I2C_SMBUS_QUICK)
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
 
     def read_byte(self, i2c_addr, force=None):
         """
@@ -391,10 +433,12 @@ class SMBus(object):
         """
         self._set_address(i2c_addr, force=force)
         msg = i2c_smbus_ioctl_data.create(
-            read_write=I2C_SMBUS_READ, command=0, size=I2C_SMBUS_BYTE
+            read_write=I2C_SMBUS_READ,
+            command=0,
+            size=I2C_SMBUS_BYTE
         )
-        ioctl(self.fd, I2C_SMBUS, msg)
-        return msg.data.contents.byte
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
+        return msg.data.data[0].byte
 
     def write_byte(self, i2c_addr, value, force=None):
         """
@@ -411,7 +455,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=value, size=I2C_SMBUS_BYTE
         )
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
 
     def read_byte_data(self, i2c_addr, register, force=None):
         """
@@ -430,8 +474,8 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_BYTE_DATA
         )
-        ioctl(self.fd, I2C_SMBUS, msg)
-        return msg.data.contents.byte
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
+        return msg.data.data[0].byte
 
     def write_byte_data(self, i2c_addr, register, value, force=None):
         """
@@ -451,8 +495,8 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_BYTE_DATA
         )
-        msg.data.contents.byte = value
-        ioctl(self.fd, I2C_SMBUS, msg)
+        msg.data.data[0].byte = value
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
 
     def read_word_data(self, i2c_addr, register, force=None):
         """
@@ -471,8 +515,8 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_WORD_DATA
         )
-        ioctl(self.fd, I2C_SMBUS, msg)
-        return msg.data.contents.word
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
+        return msg.data.data[0].word
 
     def write_word_data(self, i2c_addr, register, value, force=None):
         """
@@ -492,8 +536,8 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_WORD_DATA
         )
-        msg.data.contents.word = value
-        ioctl(self.fd, I2C_SMBUS, msg)
+        msg.data.data[0].word = value
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
 
     def process_call(self, i2c_addr, register, value, force=None):
         """
@@ -513,9 +557,9 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_PROC_CALL
         )
-        msg.data.contents.word = value
+        msg.data.data[0].word = value
         ioctl(self.fd, I2C_SMBUS, msg)
-        return msg.data.contents.word
+        return msg.data.data[0].word
 
     def read_block_data(self, i2c_addr, register, force=None):
         """
@@ -534,9 +578,9 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_BLOCK_DATA
         )
-        ioctl(self.fd, I2C_SMBUS, msg)
-        length = msg.data.contents.block[0]
-        return msg.data.contents.block[1:length + 1]
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
+        length = msg.data.data[0].block[0]
+        return msg.data.data[0].block[1:length + 1]
 
     def write_block_data(self, i2c_addr, register, data, force=None):
         """
@@ -559,9 +603,9 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_BLOCK_DATA
         )
-        msg.data.contents.block[0] = length
-        msg.data.contents.block[1:length + 1] = data
-        ioctl(self.fd, I2C_SMBUS, msg)
+        msg.data.data[0].block[0] = length
+        msg.data.data[0].block[1:length + 1] = data
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
 
     def block_process_call(self, i2c_addr, register, data, force=None):
         """
@@ -586,11 +630,11 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_BLOCK_PROC_CALL
         )
-        msg.data.contents.block[0] = length
-        msg.data.contents.block[1:length + 1] = data
-        ioctl(self.fd, I2C_SMBUS, msg)
-        length = msg.data.contents.block[0]
-        return msg.data.contents.block[1:length + 1]
+        msg.data.data[0].block[0] = length
+        msg.data.data[0].block[1:length + 1] = data
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
+        length = msg.data.data[0].block[0]
+        return msg.data.data[0].block[1:length + 1]
 
     def read_i2c_block_data(self, i2c_addr, register, length, force=None):
         """
@@ -613,9 +657,9 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_I2C_BLOCK_DATA
         )
-        msg.data.contents.byte = length
-        ioctl(self.fd, I2C_SMBUS, msg)
-        return msg.data.contents.block[1:length + 1]
+        msg.data.data[0].byte = length
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
+        return msg.data.data[0].block[1:length + 1]
 
     def write_i2c_block_data(self, i2c_addr, register, data, force=None):
         """
@@ -638,9 +682,9 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_I2C_BLOCK_DATA
         )
-        msg.data.contents.block[0] = length
-        msg.data.contents.block[1:length + 1] = data
-        ioctl(self.fd, I2C_SMBUS, msg)
+        msg.data.data[0].block[0] = length
+        msg.data.data[0].block[1:length + 1] = data
+        ioctl(self.fd, I2C_SMBUS, msg.addr())
 
     def i2c_rdwr(self, *i2c_msgs):
         """
@@ -655,4 +699,4 @@ class SMBus(object):
         :rtype: None
         """
         ioctl_data = i2c_rdwr_ioctl_data.create(*i2c_msgs)
-        ioctl(self.fd, I2C_RDWR, ioctl_data)
+        ioctl(self.fd, I2C_RDWR, ioctl_data.addr())
