@@ -700,3 +700,30 @@ class SMBus(object):
         """
         ioctl_data = i2c_rdwr_ioctl_data.create(*i2c_msgs)
         ioctl(self.fd, I2C_RDWR, ioctl_data.addr())
+
+
+    ### ----> COMPATIBILITY WITH machine.i2c <---- ###
+    def scan(self, force=False):
+        devices = []
+        for addr in range(0x03, 0x77 + 1):
+            read = SMBus.read_byte, (addr,), {'force':force}
+            write = SMBus.write_byte, (addr, 0), {'force':force}
+
+            for func, args, kwargs in (read, write):
+                try:
+                    data = func(self, *args, **kwargs)
+                    devices.append(addr)
+                    break
+                except OSError as expt:
+                    if expt.errno == 16:
+                        # just busy, maybe permanent by a kernel driver or just temporary by some user code
+                        pass
+
+        return devices
+
+    def readfrom_mem_into(self, i2c_addr, register, mv):
+        mv[:] = self.read_i2c_block_data(i2c_addr, register, len(mv))
+
+    def writeto_mem(self, i2c_addr, register, mv):
+        self.write_i2c_block_data(i2c_addr, register, mv)
+
